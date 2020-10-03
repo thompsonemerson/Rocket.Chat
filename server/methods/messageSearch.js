@@ -1,30 +1,53 @@
+import { Meteor } from 'meteor/meteor';
+import { Match, check } from 'meteor/check';
+import s from 'underscore.string';
+
+import { Subscriptions } from '../../app/models/server';
+import { Messages } from '../../app/models/server/raw';
+import { settings } from '../../app/settings';
+import { readSecondaryPreferred } from '../database/readSecondaryPreferred';
+
 Meteor.methods({
 	messageSearch(text, rid, limit) {
-		const result = {
-			messages: [],
-			users: [],
-			channels: []
-		};
-		const query = {};
-		const options = {
-			sort: {
-				ts: -1
-			},
-			limit: limit || 20
-		};
-
 		check(text, String);
-		check(rid, String);
+		check(rid, Match.Maybe(String));
 		check(limit, Match.Optional(Number));
+
+		// TODO: Evaluate why we are returning `users` and `channels`, as the only thing that gets set is the `messages`.
+		const result = {
+			message: {
+				docs: [],
+			},
+		};
 
 		const currentUserId = Meteor.userId();
 		if (!currentUserId) {
 			throw new Meteor.Error('error-invalid-user', 'Invalid user', {
-				method: 'messageSearch'
+				method: 'messageSearch',
 			});
 		}
-		const currentUserName = Meteor.user().username;
-		const currentUserTimezoneOffset = Meteor.user().utcOffset;
+
+		// Don't process anything else if the user can't access the room
+		if (rid) {
+			if (!Meteor.call('canAccessRoom', rid, currentUserId)) {
+				return result;
+			}
+		} else if (settings.get('Search.defaultProvider.GlobalSearchEnabled') !== true) {
+			return result;
+		}
+
+		const user = Meteor.user();
+		const currentUserName = user.username;
+		const currentUserTimezoneOffset = user.utcOffset;
+
+		const query = {};
+		const options = {
+			projection: {},
+			sort: {
+				ts: -1,
+			},
+			limit: limit || 20,
+		};
 
 		// I would place these methods at the bottom of the file for clarity but travis doesn't appreciate that.
 		// (no-use-before-define)
@@ -36,7 +59,7 @@ Meteor.methods({
 
 		function filterUrl() {
 			query['urls.0'] = {
-				$exists: true
+				$exists: true,
 			};
 			return '';
 		}
@@ -48,7 +71,7 @@ Meteor.methods({
 
 		function filterLocation() {
 			query.location = {
-				$exist: true
+				$exist: true,
 			};
 			return '';
 		}
@@ -56,9 +79,9 @@ Meteor.methods({
 		function filterBeforeDate(_, day, month, year) {
 			month--;
 			const beforeDate = new Date(year, month, day);
-			beforeDate.setHours(beforeDate.getUTCHours() + beforeDate.getTimezoneOffset()/60 + currentUserTimezoneOffset);
+			beforeDate.setHours(beforeDate.getUTCHours() + beforeDate.getTimezoneOffset() / 60 + currentUserTimezoneOffset);
 			query.ts = {
-				$lte: beforeDate
+				$lte: beforeDate,
 			};
 			return '';
 		}
@@ -67,12 +90,12 @@ Meteor.methods({
 			month--;
 			day++;
 			const afterDate = new Date(year, month, day);
-			afterDate.setUTCHours(afterDate.getUTCHours() + afterDate.getTimezoneOffset()/60 + currentUserTimezoneOffset);
+			afterDate.setUTCHours(afterDate.getUTCHours() + afterDate.getTimezoneOffset() / 60 + currentUserTimezoneOffset);
 			if (query.ts) {
 				query.ts.$gte = afterDate;
 			} else {
 				query.ts = {
-					$gte: afterDate
+					$gte: afterDate,
 				};
 			}
 			return '';
@@ -81,19 +104,29 @@ Meteor.methods({
 		function filterOnDate(_, day, month, year) {
 			month--;
 			const date = new Date(year, month, day);
-			date.setUTCHours(date.getUTCHours() + date.getTimezoneOffset()/60 + currentUserTimezoneOffset);
+			date.setUTCHours(date.getUTCHours() + date.getTimezoneOffset() / 60 + currentUserTimezoneOffset);
 			const dayAfter = new Date(date);
 			dayAfter.setDate(dayAfter.getDate() + 1);
 			delete query.ts;
 			query.ts = {
 				$gte: date,
-				$lt: dayAfter
+				$lt: dayAfter,
 			};
 			return '';
 		}
 
 		function filterLabel(_, tag) {
 			query['attachments.0.labels'] = new RegExp(s.escapeRegExp(tag), 'i');
+			return '';
+		}
+
+		function filterTitle(_, tag) {
+			query['attachments.title'] = new RegExp(s.escapeRegExp(tag), 'i');
+			return '';
+		}
+
+		function filterDescription(_, tag) {
+			query['attachments.description'] = new RegExp(s.escapeRegExp(tag), 'i');
 			return '';
 		}
 
@@ -119,24 +152,28 @@ Meteor.methods({
 			from.push(username);
 			return '';
 		});
+
 		if (from.length > 0) {
 			query['u.username'] = {
 				$regex: from.join('|'),
-				$options: 'i'
+				$options: 'i',
 			};
 		}
+
 		// Query for senders
 		const mention = [];
 		text = text.replace(/mention:([a-z0-9.-_]+)/ig, function(match, username) {
 			mention.push(username);
 			return '';
 		});
+
 		if (mention.length > 0) {
 			query['mentions.username'] = {
 				$regex: mention.join('|'),
-				$options: 'i'
+				$options: 'i',
 			};
 		}
+
 		// Filter on messages that are starred by the current user.
 		text = text.replace(/has:star/g, filterStarred);
 		// Filter on messages that have an url.
@@ -147,6 +184,10 @@ Meteor.methods({
 		text = text.replace(/has:location|has:map/g, filterLocation);
 		// Filter image tags
 		text = text.replace(/label:(\w+)/g, filterLabel);
+		// Filter on description of messages.
+		text = text.replace(/file-desc:(\w+)/g, filterDescription);
+		// Filter on title of messages.
+		text = text.replace(/file-title:(\w+)/g, filterTitle);
 		// Filtering before/after/on a date
 		// matches dd-MM-yyyy, dd/MM/yyyy, dd-MM-yyyy, prefixed by before:, after: and on: respectively.
 		// Example: before:15/09/2016 after: 10-08-2016
@@ -164,44 +205,55 @@ Meteor.methods({
 				const r = text.split('/');
 				query.msg = {
 					$regex: r[1],
-					$options: r[2]
+					$options: r[2],
 				};
-			} else if (RocketChat.settings.get('Message_AlwaysSearchRegExp')) {
+			} else if (settings.get('Message_AlwaysSearchRegExp')) {
 				query.msg = {
 					$regex: text,
-					$options: 'i'
+					$options: 'i',
 				};
 			} else {
 				query.$text = {
-					$search: text
+					$search: text,
 				};
-				options.fields = {
+				options.projection = {
 					score: {
-						$meta: 'textScore'
-					}
+						$meta: 'textScore',
+					},
 				};
-			}
-		}
-		if (Object.keys(query).length > 0) {
-			query.t = {
-				$ne: 'rm' //hide removed messages (useful when searching for user messages)
-			};
-			query._hidden = {
-				$ne: true // don't return _hidden messages
-			};
-			if (rid != null) {
-				query.rid = rid;
-				if (Meteor.call('canAccessRoom', rid, currentUserId) !== false) {
-					if (!RocketChat.settings.get('Message_ShowEditedStatus')) {
-						options.fields = {
-							'editedAt': 0
-						};
-					}
-					result.messages = RocketChat.models.Messages.find(query, options).fetch();
-				}
 			}
 		}
 
+		if (Object.keys(query).length > 0) {
+			query.t = {
+				$ne: 'rm', // hide removed messages (useful when searching for user messages)
+			};
+			query._hidden = {
+				$ne: true, // don't return _hidden messages
+			};
+
+			if (rid) {
+				query.rid = rid;
+			} else {
+				query.rid = {
+					$in: Subscriptions.findByUserId(user._id)
+						.fetch()
+						.map((subscription) => subscription.rid),
+				};
+			}
+
+			if (!settings.get('Message_ShowEditedStatus')) {
+				options.projection = {
+					editedAt: 0,
+				};
+			}
+
+			result.message.docs = Promise.await(Messages.find(query, {
+				readPreference: readSecondaryPreferred(Messages.col.s.db),
+				...options,
+			}).toArray());
+		}
+
 		return result;
-	}
+	},
 });

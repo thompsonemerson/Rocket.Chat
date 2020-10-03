@@ -1,9 +1,23 @@
-/* global InstanceStatus, DDP, LoggerManager */
+import { Meteor } from 'meteor/meteor';
+import { UserPresence } from 'meteor/konecty:user-presence';
+import { InstanceStatus } from 'meteor/konecty:multiple-instances-status';
+import { check } from 'meteor/check';
+import _ from 'underscore';
+import { DDP } from 'meteor/ddp';
+import { DDPCommon } from 'meteor/ddp-common';
 
-import {DDPCommon} from 'meteor/ddp-common';
+import { Logger, LoggerManager } from '../../app/logger';
+import { hasPermission } from '../../app/authorization';
+import { settings } from '../../app/settings';
+import { isDocker, getURL } from '../../app/utils';
+import { Users } from '../../app/models/server';
+import InstanceStatusModel from '../../app/models/server/models/InstanceStatus';
 
 process.env.PORT = String(process.env.PORT).trim();
 process.env.INSTANCE_IP = String(process.env.INSTANCE_IP).trim();
+
+const startMonitor = typeof process.env.DISABLE_PRESENCE_MONITOR === 'undefined'
+	|| !['true', 'yes'].includes(String(process.env.DISABLE_PRESENCE_MONITOR).toLowerCase());
 
 const connections = {};
 this.connections = connections;
@@ -12,8 +26,8 @@ const logger = new Logger('StreamBroadcast', {
 	sections: {
 		connection: 'Connection',
 		auth: 'Auth',
-		stream: 'Stream'
-	}
+		stream: 'Stream',
+	},
 });
 
 function _authorizeConnection(instance) {
@@ -31,7 +45,7 @@ function _authorizeConnection(instance) {
 
 function authorizeConnection(instance) {
 	const query = {
-		_id: InstanceStatus.id()
+		_id: InstanceStatus.id(),
 	};
 
 	if (!InstanceStatus.getCollection().findOne(query)) {
@@ -43,30 +57,27 @@ function authorizeConnection(instance) {
 	return _authorizeConnection(instance);
 }
 
+const cache = new Map();
+const originalSetDefaultStatus = UserPresence.setDefaultStatus;
 function startMatrixBroadcast() {
-	const query = {
-		'extraInformation.port': {
-			$exists: true
-		}
-	};
+	if (!startMonitor) {
+		UserPresence.setDefaultStatus = originalSetDefaultStatus;
+	}
 
-	const options = {
-		sort: {
-			_createdAt: -1
-		}
-	};
-
-	return InstanceStatus.getCollection().find(query, options).observe({
+	const actions = {
 		added(record) {
-			let instance = `${ record.extraInformation.host }:${ record.extraInformation.port }`;
+			cache.set(record._id, record);
+
+			const subPath = getURL('', { cdn: false, full: false });
+			let instance = `${ record.extraInformation.host }:${ record.extraInformation.port }${ subPath }`;
 
 			if (record.extraInformation.port === process.env.PORT && record.extraInformation.host === process.env.INSTANCE_IP) {
 				logger.auth.info('prevent self connect', instance);
 				return;
 			}
 
-			if (record.extraInformation.host === process.env.INSTANCE_IP && RocketChat.isDocker() === false) {
-				instance = `localhost:${ record.extraInformation.port }`;
+			if (record.extraInformation.host === process.env.INSTANCE_IP && isDocker() === false) {
+				instance = `localhost:${ record.extraInformation.port }${ subPath }`;
 			}
 
 			if (connections[instance] && connections[instance].instanceRecord) {
@@ -81,27 +92,34 @@ function startMatrixBroadcast() {
 			logger.connection.info('connecting in', instance);
 
 			connections[instance] = DDP.connect(instance, {
-				_dontPrintErrors: LoggerManager.logLevel < 2
+				_dontPrintErrors: LoggerManager.logLevel < 2,
 			});
 
 			connections[instance].instanceRecord = record;
 			connections[instance].instanceId = record._id;
 
-			return connections[instance].onReconnect = function() {
+			connections[instance].onReconnect = function() {
 				return authorizeConnection(instance);
 			};
 		},
 
-		removed(record) {
-			let instance = `${ record.extraInformation.host }:${ record.extraInformation.port }`;
+		removed(id) {
+			const record = cache.get(id);
+			if (!record) {
+				return;
+			}
+			cache.delete(id);
 
-			if (record.extraInformation.host === process.env.INSTANCE_IP && RocketChat.isDocker() === false) {
-				instance = `localhost:${ record.extraInformation.port }`;
+			const subPath = getURL('', { cdn: false, full: false });
+			let instance = `${ record.extraInformation.host }:${ record.extraInformation.port }${ subPath }`;
+
+			if (record.extraInformation.host === process.env.INSTANCE_IP && isDocker() === false) {
+				instance = `localhost:${ record.extraInformation.port }${ subPath }`;
 			}
 
 			const query = {
 				'extraInformation.host': record.extraInformation.host,
-				'extraInformation.port': record.extraInformation.port
+				'extraInformation.port': record.extraInformation.port,
 			};
 
 			if (connections[instance] && !InstanceStatus.getCollection().findOne(query)) {
@@ -109,6 +127,32 @@ function startMatrixBroadcast() {
 				connections[instance].disconnect();
 				return delete connections[instance];
 			}
+		},
+	};
+
+	const query = {
+		'extraInformation.port': {
+			$exists: true,
+		},
+	};
+
+	const options = {
+		sort: {
+			_createdAt: -1,
+		},
+	};
+
+	InstanceStatusModel.find(query, options).fetch().forEach(actions.added);
+	return InstanceStatusModel.on('change', ({ clientAction, id, data }) => {
+		switch (clientAction) {
+			case 'inserted':
+				if (data.extraInformation?.port) {
+					actions.added(data);
+				}
+				break;
+			case 'removed':
+				actions.removed(id);
+				break;
 		}
 	});
 }
@@ -118,13 +162,11 @@ Meteor.methods({
 		check(selfId, String);
 		check(remoteId, String);
 
-		this.unblock();
-
 		const query = {
-			_id: remoteId
+			_id: remoteId,
 		};
 
-		if (selfId === InstanceStatus.id() && remoteId !== InstanceStatus.id() && (InstanceStatus.getCollection().findOne(query))) {
+		if (selfId === InstanceStatus.id() && remoteId !== InstanceStatus.id() && InstanceStatus.getCollection().findOne(query)) {
 			this.connection.broadcastAuth = true;
 		}
 
@@ -140,12 +182,17 @@ Meteor.methods({
 			return 'not-authorized';
 		}
 
-		if (!Meteor.StreamerCentral.instances[streamName]) {
+		const instance = Meteor.StreamerCentral.instances[streamName];
+		if (!instance) {
 			return 'stream-not-exists';
 		}
 
-		Meteor.StreamerCentral.instances[streamName]._emit(eventName, args);
-	}
+		if (instance.serverOnly) {
+			instance.__emit(eventName, ...args);
+		} else {
+			Meteor.StreamerCentral.instances[streamName]._emit(eventName, args);
+		}
+	},
 });
 
 function startStreamCastBroadcast(value) {
@@ -153,12 +200,19 @@ function startStreamCastBroadcast(value) {
 
 	logger.connection.info('connecting in', instance, value);
 
+	if (!startMonitor) {
+		UserPresence.setDefaultStatus = (id, status) => {
+			Users.updateDefaultStatus(id, status);
+		};
+	}
+
 	const connection = DDP.connect(value, {
-		_dontPrintErrors: LoggerManager.logLevel < 2
+		_dontPrintErrors: LoggerManager.logLevel < 2,
 	});
 
 	connections[instance] = connection;
 	connection.instanceId = instance;
+	connection.instanceRecord = {};
 	connection.onReconnect = function() {
 		return authorizeConnection(instance);
 	};
@@ -169,7 +223,7 @@ function startStreamCastBroadcast(value) {
 			return;
 		}
 
-		const {streamName, eventName, args} = msg.fields;
+		const { streamName, eventName, args } = msg.fields;
 
 		if (!streamName || !eventName || !args) {
 			return;
@@ -179,11 +233,15 @@ function startStreamCastBroadcast(value) {
 			return 'not-authorized';
 		}
 
-		if (!Meteor.StreamerCentral.instances[streamName]) {
+		const instance = Meteor.StreamerCentral.instances[streamName];
+		if (!instance) {
 			return 'stream-not-exists';
 		}
 
-		return Meteor.StreamerCentral.instances[streamName]._emit(eventName, args);
+		if (instance.serverOnly) {
+			return instance.__emit(eventName, ...args);
+		}
+		return instance._emit(eventName, args);
 	});
 
 	return connection.subscribe('stream');
@@ -196,7 +254,7 @@ function startStreamBroadcast() {
 
 	logger.info('startStreamBroadcast');
 
-	RocketChat.settings.get('Stream_Cast_Address', function(key, value) {
+	settings.get('Stream_Cast_Address', function(key, value) {
 		// var connection, fn, instance;
 		const fn = function(instance, connection) {
 			connection.disconnect();
@@ -210,12 +268,11 @@ function startStreamBroadcast() {
 
 		if (value && value.trim() !== '') {
 			return startStreamCastBroadcast(value);
-		} else {
-			return startMatrixBroadcast();
 		}
+		return startMatrixBroadcast();
 	});
 
-	function broadcast(streamName, eventName, args/*, userId*/) {
+	function broadcast(streamName, eventName, args/* , userId*/) {
 		const fromInstance = `${ process.env.INSTANCE_IP }:${ process.env.PORT }`;
 		const results = [];
 
@@ -230,18 +287,18 @@ function startStreamBroadcast() {
 
 					switch (response) {
 						case 'self-not-authorized':
-							logger.stream.error((`Stream broadcast from '${ fromInstance }' to '${ connection._stream.endpoint }' with name ${ streamName } to self is not authorized`).red);
+							logger.stream.error(`Stream broadcast from '${ fromInstance }' to '${ connection._stream.endpoint }' with name ${ streamName } to self is not authorized`.red);
 							logger.stream.debug('    -> connection authorized'.red, connection.broadcastAuth);
 							logger.stream.debug('    -> connection status'.red, connection.status());
 							return logger.stream.debug('    -> arguments'.red, eventName, args);
 						case 'not-authorized':
-							logger.stream.error((`Stream broadcast from '${ fromInstance }' to '${ connection._stream.endpoint }' with name ${ streamName } not authorized`).red);
+							logger.stream.error(`Stream broadcast from '${ fromInstance }' to '${ connection._stream.endpoint }' with name ${ streamName } not authorized`.red);
 							logger.stream.debug('    -> connection authorized'.red, connection.broadcastAuth);
 							logger.stream.debug('    -> connection status'.red, connection.status());
 							logger.stream.debug('    -> arguments'.red, eventName, args);
 							return authorizeConnection(instance);
 						case 'stream-not-exists':
-							logger.stream.error((`Stream broadcast from '${ fromInstance }' to '${ connection._stream.endpoint }' with name ${ streamName } does not exist`).red);
+							logger.stream.error(`Stream broadcast from '${ fromInstance }' to '${ connection._stream.endpoint }' with name ${ streamName } does not exist`.red);
 							logger.stream.debug('    -> connection authorized'.red, connection.broadcastAuth);
 							logger.stream.debug('    -> connection status'.red, connection.status());
 							return logger.stream.debug('    -> arguments'.red, eventName, args);
@@ -252,8 +309,20 @@ function startStreamBroadcast() {
 		return results;
 	}
 
-	return Meteor.StreamerCentral.on('broadcast', function(streamName, eventName, args) {
+	const onBroadcast = function(streamName, eventName, args) {
 		return broadcast(streamName, eventName, args);
+	};
+
+	let TroubleshootDisableInstanceBroadcast;
+	settings.get('Troubleshoot_Disable_Instance_Broadcast', (key, value) => {
+		if (TroubleshootDisableInstanceBroadcast === value) { return; }
+		TroubleshootDisableInstanceBroadcast = value;
+
+		if (value) {
+			return Meteor.StreamerCentral.removeListener('broadcast', onBroadcast);
+		}
+
+		Meteor.StreamerCentral.on('broadcast', onBroadcast);
 	});
 }
 
@@ -263,15 +332,15 @@ Meteor.startup(function() {
 
 Meteor.methods({
 	'instances/get'() {
-		if (!RocketChat.authz.hasPermission(Meteor.userId(), 'view-statistics')) {
+		if (!hasPermission(Meteor.userId(), 'view-statistics')) {
 			throw new Meteor.Error('error-action-not-allowed', 'List instances is not allowed', {
-				method: 'instances/get'
+				method: 'instances/get',
 			});
 		}
 
-		return Object.keys(connections).map(address => {
+		return Object.keys(connections).map((address) => {
 			const conn = connections[address];
 			return Object.assign({ address, currentStatus: conn._stream.currentStatus }, _.pick(conn, 'instanceRecord', 'broadcastAuth'));
 		});
-	}
+	},
 });
